@@ -234,6 +234,7 @@ input[type=color]{width:50px;height:22px;border:1px solid var(--border2);backgro
 var RENDER_URL='https://tcrossbow.onrender.com';
 var TD_KEY='7791a0f37b2b402783abf34c97daf1d6';
 var POLY_KEY='JSfT5jxZp4vBz_79KMItB1q4uEE8YCJ7';
+var FINNHUB_KEY='d6bctepr01qnr27kgk5gd6bctepr01qnr27kgk60';
 
 // LWC 차트 인스턴스
 var _lwcChart=null, _candleSeries=null, _upperSeries=null, _lowerSeries=null, _midSeries=null;
@@ -461,19 +462,41 @@ function connectWS(sym,itv){
 }
 
 function fetchStock(sym,itv){
+  // 1순위: Finnhub REST (상업적 사용 가능)
+  var resMap={'1h':60,'4h':240,'1d':'D','1w':'W'};
+  var res=resMap[itv]||60;
+  var now=Math.floor(Date.now()/1000);
+  var fromMap={'1h':60*100*60,'4h':60*100*240,'1d':60*60*24*200,'1w':60*60*24*7*100};
+  var from=now-(fromMap[itv]||60*100*60);
   var ext=document.getElementById('ext-session').checked;
-  var ctrl=new AbortController();setTimeout(function(){ctrl.abort();},10000);
-  return fetch(RENDER_URL+'/stock?symbol='+sym+'&interval='+itv+(ext?'&extended=true':''),{signal:ctrl.signal})
-    .then(function(r){if(!r.ok)throw new Error('');return r.json();})
-    .then(function(d){if(!d||!d.length)throw new Error('');return d;})
+  var url='https://finnhub.io/api/v1/stock/candle?symbol='+sym+'&resolution='+res+'&from='+from+'&to='+now+'&token='+FINNHUB_KEY;
+
+  return fetch(url)
+    .then(function(r){return r.json();})
+    .then(function(d){
+      if(!d||d.s==='no_data'||!d.t||!d.t.length) throw new Error('no_data');
+      return d.t.map(function(t,i){
+        return{time:t,open:d.o[i],high:d.h[i],low:d.l[i],close:d.c[i]};
+      });
+    })
     .catch(function(){
-      var m={'1h':'1h','4h':'4h','1d':'1day','1w':'1week'};
-      var ext=document.getElementById('ext-session').checked;
-      return fetch('https://api.twelvedata.com/time_series?symbol='+sym+'&interval='+(m[itv]||'1h')+'&outputsize=500'+(ext?'&extended_hours=true':'')+'&apikey='+TD_KEY)
-        .then(function(r){return r.json();}).then(function(d){
-          if(d.status==='error')throw new Error(d.message||sym+' not found');
-          if(!d.values||!d.values.length)throw new Error('no data');
-          return d.values.map(function(v){return{time:Math.floor(new Date(v.datetime).getTime()/1000),open:parseFloat(v.open),high:parseFloat(v.high),low:parseFloat(v.low),close:parseFloat(v.close)};}).reverse();
+      // 폴백: Render 서버
+      var ctrl=new AbortController();setTimeout(function(){ctrl.abort();},10000);
+      return fetch(RENDER_URL+'/stock?symbol='+sym+'&interval='+itv+'&extended='+(ext?'true':'false'),{signal:ctrl.signal})
+        .then(function(r){if(!r.ok)throw new Error('');return r.json();})
+        .then(function(d){if(!d||!d.length)throw new Error('');return d;})
+        .catch(function(){
+          // 최종 폴백: Twelve Data
+          var m={'1h':'1h','4h':'4h','1d':'1day','1w':'1week'};
+          return fetch('https://api.twelvedata.com/time_series?symbol='+sym+'&interval='+(m[itv]||'1h')+'&outputsize=500'+(ext?'&extended_hours=true':'')+'&apikey='+TD_KEY)
+            .then(function(r){return r.json();})
+            .then(function(d){
+              if(d.status==='error')throw new Error(d.message||sym+' not found');
+              if(!d.values||!d.values.length)throw new Error('no data');
+              return d.values.map(function(v){
+                return{time:Math.floor(new Date(v.datetime).getTime()/1000),open:parseFloat(v.open),high:parseFloat(v.high),low:parseFloat(v.low),close:parseFloat(v.close)};
+              }).reverse();
+            });
         });
     });
 }
@@ -481,108 +504,71 @@ function fetchStock(sym,itv){
 function startStockTick(sym,itv){
   if(_tick)clearInterval(_tick);
   if(_stockWS){try{_stockWS.close();}catch(e){}_stockWS=null;}
-  // Polygon WebSocket
-  _stockWS=new WebSocket('wss://socket.polygon.io/stocks');
-  _stockWS.onopen=function(){_stockWS.send(JSON.stringify({action:'auth',params:POLY_KEY}));};
-  _stockWS.onmessage=function(e){
-    var msgs=JSON.parse(e.data);
-    msgs.forEach(function(msg){
-      if(msg.ev==='status'&&msg.status==='auth_success'){
-        _stockWS.send(JSON.stringify({action:'subscribe',params:'AM.'+sym}));
-        document.getElementById('dot-ws').className='status-dot green';
-        document.getElementById('st-ws').textContent='POLYGON WS LIVE';
-      }
-      if(msg.ev==='AM'){
-        updateLastCandle({time:Math.floor(msg.s/1000),open:msg.o,high:msg.h,low:msg.l,close:msg.c});
-      }
-      if(msg.ev==='status'&&msg.status==='auth_failed'){
-        document.getElementById('dot-ws').className='status-dot orange';
-        document.getElementById('st-ws').textContent='POLLING 15s';
-        _tick=setInterval(function(){
-          fetchStock(sym,itv).then(function(cs){
-            if(!cs.length)return;
-            var nl=cs[cs.length-1];
-            updateLastCandle(nl);
-          }).catch(function(){});
-        },15000);
-      }
-    });
+
+  document.getElementById('dot-ws').className='status-dot orange';
+  document.getElementById('st-ws').textContent='CONNECTING...';
+
+  // Finnhub WebSocket 실시간 틱
+  _stockWS = new WebSocket('wss://ws.finnhub.io?token='+FINNHUB_KEY);
+
+  _stockWS.onopen = function(){
+    _stockWS.send(JSON.stringify({"type":"subscribe","symbol":sym}));
+    document.getElementById('dot-ws').className='status-dot green';
+    document.getElementById('st-ws').textContent='FINNHUB WS LIVE';
   };
+
+  // 틱 데이터를 마지막 캔들에 반영
+  var _tickBuffer=[];
+  var _tickTimer=null;
+
+  _stockWS.onmessage = function(e){
+    var msg=JSON.parse(e.data);
+    if(msg.type==='trade'&&msg.data){
+      msg.data.forEach(function(trade){
+        _tickBuffer.push({p:trade.p, t:Math.floor(trade.t/1000), v:trade.v});
+      });
+      // 500ms마다 캔들 업데이트 (너무 자주 그리면 성능 저하)
+      if(!_tickTimer){
+        _tickTimer=setTimeout(function(){
+          _tickTimer=null;
+          if(!_tickBuffer.length||!_candles.length) return;
+          var last=_candles[_candles.length-1];
+          // 인터벌 초 계산
+          var itvSec={'1h':3600,'4h':14400,'1d':86400,'1w':604800}[itv]||3600;
+          var candleStart=Math.floor(_tickBuffer[0].t/itvSec)*itvSec;
+
+          _tickBuffer.forEach(function(tick){
+            var cs=Math.floor(tick.t/itvSec)*itvSec;
+            if(cs===last.time){
+              // 현재 캔들 업데이트
+              last.close=tick.p;
+              if(tick.p>last.high)last.high=tick.p;
+              if(tick.p<last.low)last.low=tick.p;
+            } else if(cs>last.time){
+              // 새 캔들 생성
+              _candles.push({time:cs,open:tick.p,high:tick.p,low:tick.p,close:tick.p});
+              last=_candles[_candles.length-1];
+            }
+          });
+          _tickBuffer=[];
+
+          var cfg=getCfg();var r=calcBands(_candles,cfg.length,cfg.factor);
+          _upper=r.upperBand;_lower=r.lowerBand;_mid=r.smaMid;_signals=r.signals;
+          updateLastCandle();updateUI();
+        },500);
+      }
+    }
+  };
+
   _stockWS.onclose=function(){
     document.getElementById('dot-ws').className='status-dot red';
-    document.getElementById('st-ws').textContent='POLY WS CLOSED';
-    setTimeout(function(){if(document.getElementById('mkt').value==='stock')startStockTick(sym,itv);},5000);
+    document.getElementById('st-ws').textContent='WS CLOSED';
+    setTimeout(function(){
+      if(document.getElementById('mkt').value==='stock') startStockTick(sym,itv);
+    },5000);
   };
+
   _stockWS.onerror=function(){
-    document.getElementById('dot-ws').className='status-dot orange';
-    document.getElementById('st-ws').textContent='POLLING 15s';
-    if(_tick)clearInterval(_tick);
-    _tick=setInterval(function(){
-      fetchStock(sym,itv).then(function(cs){
-        if(!cs.length)return;
-        updateLastCandle(cs[cs.length-1]);
-      }).catch(function(){});
-    },15000);
+    fallbackTick(sym,itv);
   };
 }
-
-function loadAll(){
-  var mkt=document.getElementById('mkt').value;
-  var sym=document.getElementById('sym').value.trim().toUpperCase();
-  var itv=document.getElementById('itv').value;
-  if(!sym) return;
-
-  if(_ws){try{_ws.close();}catch(e){}_ws=null;}
-  if(_stockWS){try{_stockWS.close();}catch(e){}_stockWS=null;}
-  if(_tick){clearInterval(_tick);_tick=null;}
-  _candles=[];_upper=[];_lower=[];_mid=[];_signals=[];
-
-  document.getElementById('err-bar').style.display='none';
-  document.getElementById('main-layout').style.display='none';
-  document.getElementById('ticker-bar').classList.remove('show');
-  document.getElementById('loading').classList.add('on');
-
-  var p=mkt==='crypto'?fetchCrypto(sym,itv):fetchStock(sym,itv);
-  p.then(function(candles){
-    if(!candles||candles.length<30) throw new Error('Insufficient data');
-    _candles=candles;
-
-    document.getElementById('loading').classList.remove('on');
-    document.getElementById('main-layout').style.display='grid';
-    document.getElementById('ticker-bar').classList.add('show');
-    document.getElementById('c-sym').textContent=sym+(mkt==='crypto'?'/USDT':'');
-
-    var cfg=getCfg();
-    document.getElementById('leg-u').style.background=cfg.upperColor;
-    document.getElementById('leg-m').style.background=cfg.midColor;
-    document.getElementById('leg-l').style.background=cfg.lowerColor;
-
-    // LWC 차트 빌드 (다음 프레임에 크기 잡힌 후)
-    requestAnimationFrame(function(){
-      buildLWChart(sym);
-      requestAnimationFrame(function(){
-        setChartData(candles);
-        updateUI();updateLog();
-        if(mkt==='crypto') connectWS(sym,itv);
-        else startStockTick(sym,itv);
-      });
-    });
-
-  }).catch(function(e){
-    document.getElementById('loading').classList.remove('on');
-    var el=document.getElementById('err-bar');
-    el.textContent='ERROR: '+e.message;el.style.display='block';
-  });
-}
-
-document.getElementById('sym').addEventListener('keydown',function(e){if(e.key==='Enter')loadAll();});
-
-// LightweightCharts 로딩 확인 후 실행
-function waitAndLoad(){
-  if(typeof LightweightCharts!=='undefined') loadAll();
-  else setTimeout(waitAndLoad,100);
-}
-window.addEventListener('load',waitAndLoad);
-</script>
-</body>
-</html>
