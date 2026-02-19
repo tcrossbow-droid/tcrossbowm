@@ -261,6 +261,8 @@ input[type=color]{width:50px;height:22px;border:1px solid var(--border2);backgro
 <script>
 var RENDER_URL='https://tcrossbow.onrender.com';
 var TD_KEY='7791a0f37b2b402783abf34c97daf1d6';
+var POLY_KEY='JSfT5jxZp4vBz_79KMItB1q4uEE8YCJ7';
+var _stockWS=null;
 var _candles=[],_ws=null,_tick=null;
 var _upper=[],_lower=[],_mid=[],_signals=[];
 var _viewStart=0,_viewCount=80;
@@ -540,8 +542,70 @@ function fetchStock(sym,itv){
 }
 function startStockTick(sym,itv){
   if(_tick)clearInterval(_tick);
+  if(_stockWS){try{_stockWS.close();}catch(e){}_stockWS=null;}
+
+  // Polygon.io WebSocket 실시간
   document.getElementById('dot-ws').className='status-dot orange';
-  document.getElementById('st-ws').textContent='POLLING 60s';
+  document.getElementById('st-ws').textContent='CONNECTING...';
+
+  _stockWS = new WebSocket('wss://socket.polygon.io/stocks');
+
+  _stockWS.onopen = function(){
+    _stockWS.send(JSON.stringify({"action":"auth","params":POLY_KEY}));
+  };
+
+  _stockWS.onmessage = function(e){
+    var msgs = JSON.parse(e.data);
+    msgs.forEach(function(msg){
+      if(msg.ev==='status'&&msg.status==='auth_success'){
+        // 구독: 1분봉 집계 (AM = Aggregate per Minute)
+        _stockWS.send(JSON.stringify({"action":"subscribe","params":"AM."+sym}));
+        document.getElementById('dot-ws').className='status-dot green';
+        document.getElementById('st-ws').textContent='POLY WS LIVE';
+      }
+      if(msg.ev==='AM'){
+        // AM = Aggregate Minute bar
+        var c={
+          time: Math.floor(msg.s/1000), // msg.s = start timestamp ms
+          open: msg.o,
+          high: msg.h,
+          low: msg.l,
+          close: msg.c
+        };
+        var ex=_candles[_candles.length-1];
+        if(ex&&ex.time===c.time) _candles[_candles.length-1]=c;
+        else if(c.time>(ex?ex.time:0)) _candles.push(c);
+        else return;
+        var cfg=getCfg();var r=calcBands(_candles,cfg.length,cfg.factor);
+        _upper=r.upperBand;_lower=r.lowerBand;_mid=r.smaMid;_signals=r.signals;
+        drawChart();updateUI();
+      }
+      if(msg.ev==='status'&&msg.status==='auth_failed'){
+        document.getElementById('dot-ws').className='status-dot red';
+        document.getElementById('st-ws').textContent='AUTH FAILED';
+        // 폴백: 15초 폴링
+        fallbackTick(sym,itv);
+      }
+    });
+  };
+
+  _stockWS.onclose = function(){
+    document.getElementById('dot-ws').className='status-dot red';
+    document.getElementById('st-ws').textContent='WS CLOSED';
+    setTimeout(function(){
+      if(document.getElementById('mkt').value==='stock') startStockTick(sym,itv);
+    },5000);
+  };
+
+  _stockWS.onerror = function(){
+    fallbackTick(sym,itv);
+  };
+}
+
+function fallbackTick(sym,itv){
+  if(_tick)clearInterval(_tick);
+  document.getElementById('dot-ws').className='status-dot orange';
+  document.getElementById('st-ws').textContent='POLLING 15s';
   _tick=setInterval(function(){
     fetchStock(sym,itv).then(function(cs){
       if(!cs.length)return;
@@ -553,13 +617,14 @@ function startStockTick(sym,itv){
       _upper=r.upperBand;_lower=r.lowerBand;_mid=r.smaMid;_signals=r.signals;
       drawChart();updateUI();
     }).catch(function(){});
-  },60000);
+  },15000);
 }
 
 function loadAll(){
   var mkt=document.getElementById('mkt').value,sym=document.getElementById('sym').value.trim().toUpperCase(),itv=document.getElementById('itv').value;
   if(!sym)return;
   if(_ws){try{_ws.close();}catch(e){}_ws=null;}
+  if(_stockWS){try{_stockWS.close();}catch(e){}_stockWS=null;}
   if(_tick){clearInterval(_tick);_tick=null;}
   _candles=[];_upper=[];_lower=[];_mid=[];_signals=[];
   document.getElementById('err-bar').style.display='none';
